@@ -1,4 +1,132 @@
 
+# vLLM Docker for 3+ Node DGX Spark Full-Mesh Clusters
+
+Multi-node vLLM inference over **switchless direct-connect RDMA mesh** topologies. Extends [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) with:
+
+- **NCCL mesh plugin** — custom `libnccl-net.so` that enables NCCL over direct-cable RoCE links where each node pair is on a different subnet (thanks to [autoscriptlabs/nccl-mesh-plugin](https://github.com/autoscriptlabs/nccl-mesh-plugin))
+- **RayV2 Executor** — replaces Ray Compiled DAG with direct `ray.remote()` + native NCCL, fixing the second-prompt deadlock on jittery mesh interconnects ([vLLM RFC #35848](https://github.com/vllm-project/vllm/issues/35848))
+- **`launch-cluster-override.sh`** — extended launch script with `--apply-mod` support for runtime patching
+
+## Quick Start (Full-Mesh Cluster)
+
+### Prerequisites
+
+- 3+ DGX Spark nodes with direct cables between each pair (full mesh)
+- Each node pair on a separate subnet (standard for switchless ConnectX-7 setups)
+- Passwordless SSH between all nodes
+- Docker image built per the [standard spark-vllm-docker guide](#1-building-the-docker-image) below
+
+### 1. Build the Docker image
+
+Follow the standard [spark-vllm-docker build instructions](#1-building-the-docker-image):
+
+```bash
+git clone <this-repo>
+cd <this-repo>
+./build-and-copy.sh -c
+```
+
+### 2. Run mesh setup (one time)
+
+This builds the NCCL mesh plugin and copies it to all nodes:
+
+```bash
+./mesh-setup.sh \
+  --nodes 192.168.3.105,192.168.3.106,192.168.3.107 \
+  --mgmt-if enP7s7 \
+  --model-path /path/to/your/model
+```
+
+| Flag | Description |
+|------|-------------|
+| `--nodes` | Comma-separated node IPs (head first) |
+| `--mgmt-if` | Management NIC for Gloo/NCCL socket traffic (the interface with your node's SSH IP — **not** an RDMA interface) |
+| `--ib-hca` | RDMA HCA devices (auto-detected if omitted) |
+| `--gid-index` | RoCE GID index (default: 3, try 0-3 if connection issues) |
+| `--stagger-sec` | Seconds of stagger per rank during NCCL init (default: 3) |
+| `--model-path` | Local path to model weights (mounted as `/model_data` in container) |
+| `--skip-build` | Use existing `lib/libnccl-net.so` instead of rebuilding |
+| `--skip-copy` | Don't copy plugin to remote nodes |
+
+This generates `mesh-env.sh` with all the required Docker environment variables.
+
+### 3. Launch
+
+```bash
+source mesh-env.sh
+
+# Add any additional vLLM tuning flags
+export VLLM_SPARK_EXTRA_DOCKER_ARGS="$VLLM_SPARK_EXTRA_DOCKER_ARGS \
+  -e VLLM_USE_DEEP_GEMM=0 \
+  -e VLLM_USE_FLASHINFER_MOE_FP16=1 \
+  -e VLLM_USE_FLASHINFER_SAMPLER=0 \
+  -e OMP_NUM_THREADS=4"
+
+./launch-cluster-override.sh \
+  --nodes "192.168.3.105,192.168.3.106,192.168.3.107" \
+  --apply-mod mods/ray-v2-executor-mod \
+  exec vllm serve /model_data \
+  --port 8000 --host 0.0.0.0 \
+  --tensor-parallel-size 1 \
+  --pipeline-parallel-size 3 \
+  --distributed-executor-backend ray \
+  --gpu-memory-utilization 0.88 \
+  --max-model-len 262144 \
+  --max-num-batched-tokens 8192 \
+  --max-num-seqs 8 \
+  --trust-remote-code \
+  --dtype bfloat16 \
+  --kv-cache-dtype fp8 \
+  --attention-backend flashinfer \
+  --compilation-config.cudagraph_mode none
+```
+
+> **Note:** Use `launch-cluster-override.sh` (not `launch-cluster.sh`) for mesh clusters. It adds `--apply-mod` support for runtime patching.
+
+### How it works
+
+Standard vLLM uses **Ray Compiled DAG** for pipeline-parallel communication. This creates rigid shared-memory channels with hard timeouts that don't tolerate the jitter inherent to switchless RDMA meshes with custom NCCL plugins. The result: first prompt works, second prompt deadlocks.
+
+The **RayV2 Executor** (`mods/ray-v2-executor-mod`) fixes this by:
+1. Keeping Ray for process placement and lifecycle (placement groups, actor creation, model loading)
+2. Replacing the Compiled DAG hot path with direct `ray.remote()` calls
+3. Letting native NCCL handle all inter-stage tensor communication (PP send/recv, token broadcast)
+
+The mod is applied at container startup via `--apply-mod` — no Docker rebuild required. It patches three things:
+- Installs `ray_v2_executor.py` into `vllm/v1/executor/`
+- Rewires `abstract.py` so `--distributed-executor-backend ray` loads `RayV2Executor` instead of the default `RayDistributedExecutor`
+- Patches `parallel_state.py` to lock Gloo/NCCL to the management interface and stagger NCCL init per rank
+
+### Finding your management interface
+
+Your management interface is the NIC that carries your node's SSH-accessible IP (the `192.168.x.x` address you use for `--nodes`). To find it:
+
+```bash
+ip -br addr show | grep UP
+```
+
+Look for the interface with your node's management IP. On DGX Spark with 200Gbps QSFP56 cables, this is typically `enP7s7` (the 10G management port), **not** the RoCE interfaces (`rocep1s0f0`, etc.) which carry fabric traffic on different subnets.
+
+### Pipeline parallelism sizing
+
+With `PP=N` and `TP=1`, each of the N nodes runs one pipeline stage. This is the natural fit for mesh clusters where each node has one GPU:
+
+| Nodes | Setting |
+|-------|---------|
+| 2 | `--pipeline-parallel-size 2 --tensor-parallel-size 1` |
+| 3 | `--pipeline-parallel-size 3 --tensor-parallel-size 1` |
+| 4 | `--pipeline-parallel-size 4 --tensor-parallel-size 1` |
+
+TP>1 requires the model's attention heads to be evenly divisible by TP×PP. With PP=3 on most models, TP=1 is the only option.
+
+---
+
+# Standard spark-vllm-docker Documentation
+
+> Everything below is from the upstream [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) project. Follow these instructions for building the Docker image, standard 2-node setups, solo mode, etc.
+
+---
+
 # vLLM Docker Optimized for DGX Spark (single or multi-node)
 
 This repository contains the Docker configuration and startup scripts to run a multi-node vLLM inference cluster using Ray. It supports InfiniBand/RDMA (NCCL) and custom environment configuration for high-performance setups.
