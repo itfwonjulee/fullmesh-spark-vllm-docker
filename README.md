@@ -21,9 +21,9 @@ Multi-node vLLM inference over **switchless direct-connect RDMA mesh** topologie
 Follow the standard [spark-vllm-docker build instructions](#1-building-the-docker-image):
 
 ```bash
-git clone <this-repo>
-cd <this-repo>
-./build-and-copy.sh -c --copy-to NODE2 NODE3 NODE-N
+git clone https://github.com/itfwonjulee/fullmesh-spark-vllm-docker.git
+cd fullmesh-spark-vllm-docker
+./build-and-copy.sh -c --copy-to NODE2 NODE3 NODE-N # IPs as registered in the enP7s7 MANAGEMENT INTERFACE (NOT CONNECTX)
 ```
 
 ### 2. Run mesh setup (one time)
@@ -32,9 +32,9 @@ This builds the NCCL mesh plugin and copies it to all nodes:
 
 ```bash
 ./mesh-setup.sh \
-  --nodes 192.168.3.105,192.168.3.106,192.168.3.107 \
-  --mgmt-if enP7s7 \ # OR YOUR MANAGEMENT INTERFACE I.E. YOUR REGULAR 10GBPS ETHERNET
-  --model-path /path/to/your/model
+  --nodes IP1,IP2,IP3,IP-N \
+  --mgmt-if enP7s7 \ # OR YOUR MANAGEMENT INTERFACE I.E. YOUR REGULAR 10GBPS ETHERNET (NOT CONNECTX)
+  --model-path /path/to/your/model 
 ```
 
 | Flag | Description |
