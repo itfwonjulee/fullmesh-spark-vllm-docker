@@ -23,7 +23,7 @@ Follow the standard [spark-vllm-docker build instructions](#1-building-the-docke
 ```bash
 git clone <this-repo>
 cd <this-repo>
-./build-and-copy.sh -c
+./build-and-copy.sh -c --copy-to NODE2 NODE3 NODE-N
 ```
 
 ### 2. Run mesh setup (one time)
@@ -33,7 +33,7 @@ This builds the NCCL mesh plugin and copies it to all nodes:
 ```bash
 ./mesh-setup.sh \
   --nodes 192.168.3.105,192.168.3.106,192.168.3.107 \
-  --mgmt-if enP7s7 \
+  --mgmt-if enP7s7 \ # OR YOUR MANAGEMENT INTERFACE I.E. YOUR REGULAR 10GBPS ETHERNET
   --model-path /path/to/your/model
 ```
 
@@ -62,6 +62,7 @@ export VLLM_SPARK_EXTRA_DOCKER_ARGS="$VLLM_SPARK_EXTRA_DOCKER_ARGS \
   -e VLLM_USE_FLASHINFER_SAMPLER=0 \
   -e OMP_NUM_THREADS=4"
 
+# mod these to your liking
 ./launch-cluster-override.sh \
   --nodes "192.168.3.105,192.168.3.106,192.168.3.107" \
   --apply-mod mods/ray-v2-executor-mod \
