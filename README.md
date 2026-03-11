@@ -1,7 +1,7 @@
 
 # vLLM Docker for 3+ Node DGX Spark Full-Mesh Clusters
 
-Multi-node vLLM inference over **switchless direct-connect RDMA mesh** topologies. Extends [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) with:
+Super bootstrappy, and possibly super unreliable multi-node vLLM inference over **switchless direct-connect RDMA mesh** topologies. Extends [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) with:
 
 - **NCCL mesh plugin** — custom `libnccl-net.so` that enables NCCL over direct-cable RoCE links where each node pair is on a different subnet (thanks to [autoscriptlabs/nccl-mesh-plugin](https://github.com/autoscriptlabs/nccl-mesh-plugin))
 - **RayV2 Executor** — replaces Ray Compiled DAG with direct `ray.remote()` + native NCCL, fixing the second-prompt deadlock on jittery mesh interconnects ([vLLM RFC #35848](https://github.com/vllm-project/vllm/issues/35848))
