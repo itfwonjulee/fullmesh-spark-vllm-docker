@@ -1,33 +1,28 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────
-# fix-qwen3.5-linear-attn-mod/run.sh  (v9)
+# fix-qwen3.5-linear-attn-mod/run.sh  (v10)
 #
 # Fixes Qwen-3.5 MoE hybrid attention + Pipeline Parallelism crashes.
 #
-# Root cause 1: get_attn_backends_for_group() iterates all layer names
-# from KV cache group spec, but get_layers_from_vllm_config() only
-# returns local AttentionLayerBase instances.  Non-local layers
-# (from other PP stages) cause KeyError.
+# Root cause 1 (v9): get_attn_backends_for_group() and init_attn_backend()
+# iterate global layer names but only local layers exist → KeyError.
+# Fix: skip non-local layers with a guard.
 #
-# Root cause 2: _cleanup_profiling_kv_cache() sets layer.kv_cache=[]
-# for ALL layers after profiling.  If the subsequent
-# initialize_kv_cache_tensors returns empty kv_caches (due to the
-# same non-local layer issue in attn_groups), bind_kv_cache({}) is
-# a no-op and layers keep kv_cache=[], causing IndexError in forward.
-#
-# v9 approach:
-#   - Guard in get_attn_backends_for_group (same as v8)
-#   - ALSO guard init_attn_backend() in attn_utils.py (the secondary
-#     code path) for the same non-local layer issue
-#   - Enhanced diagnostics at EVERY stage of initialize_kv_cache
-#   - SAFETY: After bind_kv_cache, restore PP-sized placeholder for
-#     any layer that still has kv_cache=[] so IndexError is prevented
+# Root cause 2 (v10): Ray executor sorts workers by IP after creation
+# and calls adjust_rank() which updates rpc_rank but NOT global_rank.
+# WorkerWrapperBase.initialize_from_config() indexes kv_cache_configs
+# by global_rank — a stale value. If Ray placed workers in a different
+# order than the IP sort, configs get sent to the WRONG ranks, causing:
+#   - attn_groups empty (layers not found locally)
+#   - kv_caches empty  → safety net fires
+#   - attn_metadata missing → KeyError in forward pass
+# Fix: patch adjust_rank() to also update global_rank.
 # ─────────────────────────────────────────────────────────────────────
 set -e
 
 echo ""
 echo "╔═══════════════════════════════════════════════════════════╗"
-echo "║  Fix Qwen3.5 Linear Attention + PP — Installing (v9)     ║"
+echo "║  Fix Qwen3.5 Linear Attention + PP — Installing (v10)    ║"
 echo "╚═══════════════════════════════════════════════════════════╝"
 
 VLLM_DIR=$(python3 -c "import os, vllm; print(os.path.dirname(vllm.__file__))")
@@ -282,12 +277,79 @@ else:
         sys.exit(1)
 PYEOF
 
+# ═══════════════════════════════════════════════════════════════════════
+# PATCH 3: ray_utils.py — fix adjust_rank to also update global_rank
+# ═══════════════════════════════════════════════════════════════════════
+python3 << 'PYEOF'
+import sys, os, shutil, py_compile, vllm
+
+vllm_dir = os.path.dirname(vllm.__file__)
+target = os.path.join(vllm_dir, "v1", "executor", "ray_utils.py")
+
+with open(target, "r") as f:
+    source = f.read()
+
+if "QWEN35_FIX_V10" in source:
+    print("  · ray_utils.py already patched, skipping")
+    sys.exit(0)
+
+# The bug: adjust_rank updates rpc_rank but not global_rank.
+# WorkerWrapperBase.initialize_from_config indexes kv_cache_configs
+# by global_rank. After Ray sorts workers and calls adjust_rank,
+# global_rank is stale → wrong kv_cache_config → wrong layers.
+old = (
+    "        def adjust_rank(self, rank_mapping: dict[int, int]) -> None:\n"
+    '            """\n'
+    "            Adjust the rpc_rank based on the given mapping.\n"
+    "            It is only used during the initialization of the executor,\n"
+    "            to adjust the rpc_rank of workers after we create all workers.\n"
+    '            """\n'
+    "            if self.rpc_rank in rank_mapping:\n"
+    "                self.rpc_rank = rank_mapping[self.rpc_rank]"
+)
+
+new = (
+    "        def adjust_rank(self, rank_mapping: dict[int, int]) -> None:\n"
+    '            """\n'
+    "            Adjust the rpc_rank based on the given mapping.\n"
+    "            It is only used during the initialization of the executor,\n"
+    "            to adjust the rpc_rank of workers after we create all workers.\n"
+    '            """\n'
+    "            if self.rpc_rank in rank_mapping:\n"
+    "                self.rpc_rank = rank_mapping[self.rpc_rank]\n"
+    "            if self.global_rank in rank_mapping:  # QWEN35_FIX_V10\n"
+    "                self.global_rank = rank_mapping[self.global_rank]"
+)
+
+if old not in source:
+    print("  · ray_utils.py: adjust_rank pattern not found (may be different version)")
+    sys.exit(0)
+
+backup = target + ".qwen35fix.bak"
+shutil.copy2(target, backup)
+
+patched = source.replace(old, new, 1)
+
+with open(target, "w") as f:
+    f.write(patched)
+
+try:
+    py_compile.compile(target, doraise=True)
+    print("  ✓ ray_utils.py: adjust_rank now also updates global_rank, syntax OK")
+    os.remove(backup)
+except py_compile.PyCompileError as e:
+    print(f"  ✗ SYNTAX ERROR: {e}")
+    shutil.move(backup, target)
+    sys.exit(1)
+PYEOF
+
 echo ""
 echo "╔═══════════════════════════════════════════════════════════╗"
-echo "║  Fix Qwen3.5 Linear Attention + PP — Complete (v9)       ║"
+echo "║  Fix Qwen3.5 Linear Attention + PP — Complete (v10)      ║"
 echo "╠═══════════════════════════════════════════════════════════╣"
 echo "║  Patch 1: Guard non-local layers in gpu_model_runner.py   ║"
 echo "║  Patch 2: Guard non-local layers in attn_utils.py         ║"
+echo "║  Patch 3: Fix adjust_rank to sync global_rank             ║"
 echo "║  + Deep diagnostics at pre/post bind_kv_cache             ║"
 echo "║  + Safety: Restore PP-sized placeholder for empty kv_cache ║"
 echo "╚═══════════════════════════════════════════════════════════╝"
