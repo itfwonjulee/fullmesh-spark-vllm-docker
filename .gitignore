@@ -2,3 +2,4 @@
 *.so
 mesh-env.sh
 nccl-mesh-plugin/
+wheels/

@@ -255,8 +255,9 @@ ARG PRE_TRANSFORMERS=0
 RUN --mount=type=bind,source=wheels,target=/workspace/wheels \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     if [ "$PRE_TRANSFORMERS" = "1" ]; then \
-        echo "transformers>=5.0.0" > /tmp/tf-override.txt && \
-        uv pip install /workspace/wheels/*.whl --override /tmp/tf-override.txt; \
+        echo "transformers>=5.0.0.dev0" > /tmp/tf-override.txt && \
+        uv pip install /workspace/wheels/*.whl --override /tmp/tf-override.txt --prerelease allow && \
+        uv pip install --prerelease allow "transformers @ git+https://github.com/huggingface/transformers.git@main"; \
     else \
         uv pip install /workspace/wheels/*.whl; \
     fi
