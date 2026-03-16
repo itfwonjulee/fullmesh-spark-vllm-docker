@@ -278,6 +278,64 @@ Don't do it every time you rebuild, because it will slow down compilation times.
 
 For periodic maintenance, I recommend using a filter: `docker builder prune --filter until=72h`
 
+### 2026-03-12
+
+#### Nemotron-3-Super-120B NVFP4 Recipe
+
+Added a new recipe `nemotron-3-super-nvfp4` for running `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` with Marlin kernels. Supports both solo and cluster modes. Includes a custom reasoning parser (`super_v3_reasoning_parser.py`) fetched from the model repository. Supports both dual and single Spark configurations.
+
+```bash
+./run-recipe.sh nemotron-3-super-nvfp4
+```
+
+### 2026-03-11
+
+#### Qwen3-Coder-Next INT4-AutoRound Recipe
+
+Added a new recipe `qwen3-coder-next-int4-autoround` for running Intel/Qwen3-Coder-Next-int4-AutoRound. Supports single Spark only (use with `--solo` switch), since split weights are too small for Marlin kernel.
+
+```bash
+./run-recipe.sh qwen3-coder-next-int4-autoround --solo
+```
+
+### 2026-03-06
+
+#### `-e/--env` Passthrough in `run-recipe.py`
+
+`run-recipe.sh` now accepts one or more `-e VAR=VALUE` flags to pass environment variables directly to the container, mirroring the existing behaviour of `launch-cluster.sh`.
+
+```bash
+./run-recipe.sh qwen3.5-122b-int4-autoround --solo -e HF_TOKEN=$HF_TOKEN
+```
+
+#### Unsloth Chat Template for Qwen3.5
+
+Added a new mod `mods/fix-qwen3.5-chat-template` that applies the Unsloth chat template to Qwen3.5 models for better compatibility with modern clients. The template is now included in the `qwen3.5-122b-fp8`, `qwen3.5-122b-int4-autoround`, and `qwen3.5-35b-a3b-fp8` recipes.
+
+#### Fix Shell Quoting for Exec Command Arguments
+
+Fixed shell quoting for exec command arguments in `launch-cluster.sh` and `run-recipe.py` to correctly handle arguments containing spaces or special characters.
+
+### 2026-03-05
+
+#### Qwen3.5-35B-A3B-FP8 Recipe
+
+Added a new recipe `qwen3.5-35b-a3b-fp8` for running Qwen3.5-35B-A3B in FP8 format.
+
+```bash
+./run-recipe.sh qwen3.5-35b-a3b-fp8
+```
+
+#### 4× Spark Cluster Recipes
+
+Added a `recipes/4x-spark-cluster/` subdirectory with recipes optimised for a 4-node Spark cluster:
+- `minimax-m2.5` — MiniMax M2.5 on 4× Spark
+- `qwen3.5-397b-a17B-fp8` — Qwen3.5-397B-A17B in FP8 on 4× Spark
+
+#### More Robust Wheels Check Before Download
+
+Improved the wheels availability check in `build-and-copy.sh` to be more reliable when deciding whether to download remote wheels.
+
 ### 2026-03-04
 
 #### Prebuilt vLLM Wheels via GitHub Releases
@@ -291,7 +349,15 @@ The download logic mirrors the FlashInfer behaviour:
 
 No new flags are required — the download happens transparently.
 
-All prebuilt wheels are now tested with multiple models in both solo and cluster configuration as a part of automated deployment pipeline which will now run nightly. The wheels are released only if they pass all the tests and no significant performance regressions are detected. 
+All prebuilt wheels are now tested with multiple models in both solo and cluster configuration as a part of automated deployment pipeline which will now run nightly. The wheels are released only if they pass all the tests and no significant performance regressions are detected.
+
+#### Qwen3.5-122B-FP8 Recipe
+
+Added a new recipe `qwen3.5-122b-fp8` for running Qwen3.5-122B in FP8 format.
+
+```bash
+./run-recipe.sh qwen3.5-122b-fp8
+```
 
 ### 2026-03-02
 
