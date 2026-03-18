@@ -393,7 +393,7 @@ def check_model_exists(model: str) -> bool:
     return False
 
 
-def generate_launch_script(recipe: dict[str, Any], overrides: dict[str, Any], is_solo: bool = False, extra_args: list[str] | None = None) -> str:
+def generate_launch_script(recipe: dict[str, Any], overrides: dict[str, Any], is_solo: bool = False, extra_args: list[str] | None = None, no_ray: bool = False) -> str:
     """
     Generate a bash launch script from the recipe.
     
@@ -458,9 +458,9 @@ def generate_launch_script(recipe: dict[str, Any], overrides: dict[str, Any], is
         print(f"Available parameters: {list(params.keys())}")
         sys.exit(1)
     
-    # In solo mode, remove --distributed-executor-backend ray
-    # (it's not needed and can cause issues on single node)
-    if is_solo:
+    # In solo or no-ray mode, remove --distributed-executor-backend
+    # (not needed for solo; no-ray uses PyTorch distributed instead)
+    if is_solo or no_ray:
         import re
         # Remove the entire line containing --distributed-executor-backend
         # This handles multi-line commands with backslash continuations
@@ -470,17 +470,17 @@ def generate_launch_script(recipe: dict[str, Any], overrides: dict[str, Any], is
             if '--distributed-executor-backend' not in line
         ]
         command = '\n'.join(filtered_lines)
+
+    # Remove trailing backslash if present
+    command = command.rstrip()
+    if command.endswith('\\'):
+        command = command.rstrip('\\\n').rstrip()
     
     # Append extra args if provided (after --)
     if extra_args:
         # Join extra args and append to command
         extra_args_str = ' '.join(shlex.quote(a) for a in extra_args)
-        command = command.rstrip()
-        # Handle multi-line commands with backslash continuations
-        if command.endswith('\\'):
-            command = command.rstrip('\\').rstrip() + ' \\\n    ' + extra_args_str
-        else:
-            command = command + ' ' + extra_args_str
+        command = command + ' ' + extra_args_str
     
     lines.append("# Run the model")
     lines.append(command.strip())
@@ -820,7 +820,23 @@ Examples:
     launch_group.add_argument("-t", "--container", dest="container_override", help="Override container image from recipe")
     launch_group.add_argument("--nccl-debug", choices=["VERSION", "WARN", "INFO", "TRACE"], help="NCCL debug level")
     launch_group.add_argument("-e", "--env", action="append", dest="env_vars", default=[], metavar="VAR=VALUE", help="Environment variable to pass to container (e.g. -e HF_TOKEN=xxx). Can be used multiple times.")
-    
+    launch_group.add_argument(
+        "--no-ray",
+        action="store_true",
+        dest="no_ray",
+        help="No-Ray mode: run multi-node vLLM without Ray (uses PyTorch distributed backend)"
+    )
+    launch_group.add_argument("--name", dest="container_name", help="Override container name (default: vllm_node)")
+    launch_group.add_argument("--eth-if", dest="eth_if", help="Ethernet interface (overrides .env and auto-detection)")
+    launch_group.add_argument("--ib-if", dest="ib_if", help="InfiniBand interface (overrides .env and auto-detection)")
+    launch_group.add_argument("-j", dest="build_jobs", type=int, metavar="N", help="Number of parallel build jobs inside container")
+    launch_group.add_argument("--no-cache-dirs", action="store_true", dest="no_cache_dirs", help="Do not mount ~/.cache/vllm, ~/.cache/flashinfer, ~/.triton")
+    launch_group.add_argument("--non-privileged", action="store_true", dest="non_privileged", help="Run in non-privileged mode (removes --privileged and --ipc=host)")
+    launch_group.add_argument("--mem-limit-gb", type=int, dest="mem_limit_gb", help="Memory limit in GB (only with --non-privileged)")
+    launch_group.add_argument("--mem-swap-limit-gb", type=int, dest="mem_swap_limit_gb", help="Memory+swap limit in GB (only with --non-privileged)")
+    launch_group.add_argument("--pids-limit", type=int, dest="pids_limit", help="Process limit (only with --non-privileged, default: 4096)")
+    launch_group.add_argument("--shm-size-gb", type=int, dest="shm_size_gb", help="Shared memory size in GB (only with --non-privileged, default: 64)")
+
     # Cluster discovery options
     discover_group = parser.add_argument_group("Cluster discovery")
     discover_group.add_argument(
@@ -895,44 +911,60 @@ Examples:
     build_args = recipe.get("build_args", [])
     
     # Parse nodes - check command line first, then .env file, then autodiscover
-    nodes = parse_nodes(args.nodes)
+    nodes = parse_nodes(args.nodes) if not args.solo else []
     nodes_from_env = False
+    eth_if = None
+    ib_if = None
     
-    if not nodes and not args.solo:
+    if not args.solo:
         # Try to load from .env file
         env = load_env_file()
-        if env.get("CLUSTER_NODES"):
-            nodes = parse_nodes(env["CLUSTER_NODES"])
-            nodes_from_env = True
-            if nodes:
-                print(f"Using cluster nodes from .env: {', '.join(nodes)}")
-                print()
-        else:
-            # No nodes specified and no .env - run autodiscover
-            print("No cluster nodes configured. Running autodiscover...")
-            print()
-            
-            discovered_env = run_autodiscover()
-            if discovered_env and discovered_env.get("CLUSTER_NODES"):
-                nodes = parse_nodes(discovered_env["CLUSTER_NODES"])
+        if not nodes:
+            if env.get("CLUSTER_NODES"):
+                nodes = parse_nodes(env["CLUSTER_NODES"])
                 nodes_from_env = True
-                
                 if nodes:
-                    # Ask if user wants to save to .env
+                    print(f"Using cluster nodes from .env: {', '.join(nodes)}")
                     print()
-                    response = input("Save this configuration to .env for future use? [Y/n]: ").strip().lower()
-                    if response in ("", "y", "yes"):
-                        save_env_file(discovered_env)
-                    print()
+            else:
+                # No nodes specified and no .env - run autodiscover
+                print("No cluster nodes configured. Running autodiscover...")
+                print()
+                
+                discovered_env = run_autodiscover()
+                if discovered_env and discovered_env.get("CLUSTER_NODES"):
+                    nodes = parse_nodes(discovered_env["CLUSTER_NODES"])
+                    nodes_from_env = True
+                    
+                    if nodes:
+                        # Ask if user wants to save to .env
+                        print()
+                        response = input("Save this configuration to .env for future use? [Y/n]: ").strip().lower()
+                        if response in ("", "y", "yes"):
+                            save_env_file(discovered_env)
+                        print()
+
+        # Resolve network interfaces: CLI > .env > auto-detect by launch-cluster.sh
+        eth_if = args.eth_if or None
+        ib_if = args.ib_if or None
+        if not eth_if or not ib_if:
+            if not eth_if and env.get("ETH_IF"):
+                eth_if = env["ETH_IF"]
+            if not ib_if and env.get("IB_IF"):
+                ib_if = env["IB_IF"]
     
     worker_nodes = get_worker_nodes(nodes) if nodes else []
     is_cluster = len(nodes) > 1
-    
+
     # Check if recipe requires cluster mode
     cluster_only = recipe.get("cluster_only", False)
     solo_only = recipe.get("solo_only", False)
     is_solo = args.solo or not is_cluster
     
+    if getattr(args, 'no_ray', False) and is_solo:
+        print("Error: --no-ray is incompatible with --solo. Solo mode already runs without Ray.")
+        return 1
+
     if cluster_only and is_solo:
         print(f"Error: Recipe '{recipe['name']}' requires cluster mode.")
         print(f"This model is too large to run on a single node.")
@@ -972,8 +1004,16 @@ Examples:
             if worker_nodes:
                 print(f"  Workers: {', '.join(worker_nodes)}")
         print(f"Solo mode: {is_solo}")
+        if eth_if:
+            print(f"Ethernet interface: {eth_if}{' (from .env)' if not args.eth_if else ''}")
+        if ib_if:
+            print(f"InfiniBand interface: {ib_if}{' (from .env)' if not args.ib_if else ''}")
+        if args.container_name:
+            print(f"Container name: {args.container_name}")
+        if args.non_privileged:
+            print("Non-privileged mode: Yes")
         print()
-    
+
     # --- Build Phase ---
     if args.build_only or args.setup or args.force_build:
         if args.dry_run:
@@ -1097,7 +1137,7 @@ Examples:
                     print(f"         vLLM uses last value; extra args appear after template substitution")
     
     # Generate launch script
-    script_content = generate_launch_script(recipe, overrides, is_solo=is_solo, extra_args=extra_args)
+    script_content = generate_launch_script(recipe, overrides, is_solo=is_solo, extra_args=extra_args, no_ray=getattr(args, 'no_ray', False))
     
     if args.dry_run:
         print("=== Generated Launch Script ===")
@@ -1116,12 +1156,34 @@ Examples:
             cmd_parts.append("--solo")
         if args.daemon:
             cmd_parts.append("-d")
+        if getattr(args, 'no_ray', False):
+            cmd_parts.append("--no-ray")
         if nodes:
             cmd_parts.extend(["-n", ",".join(nodes)])
         if args.nccl_debug:
             cmd_parts.extend(["--nccl-debug", args.nccl_debug])
         for env_var in args.env_vars:
             cmd_parts.extend(["-e", env_var])
+        if args.container_name:
+            cmd_parts.extend(["--name", args.container_name])
+        if eth_if:
+            cmd_parts.extend(["--eth-if", eth_if])
+        if ib_if:
+            cmd_parts.extend(["--ib-if", ib_if])
+        if args.build_jobs:
+            cmd_parts.extend(["-j", str(args.build_jobs)])
+        if args.no_cache_dirs:
+            cmd_parts.append("--no-cache-dirs")
+        if args.non_privileged:
+            cmd_parts.append("--non-privileged")
+        if args.mem_limit_gb:
+            cmd_parts.extend(["--mem-limit-gb", str(args.mem_limit_gb)])
+        if args.mem_swap_limit_gb:
+            cmd_parts.extend(["--mem-swap-limit-gb", str(args.mem_swap_limit_gb)])
+        if args.pids_limit:
+            cmd_parts.extend(["--pids-limit", str(args.pids_limit)])
+        if args.shm_size_gb:
+            cmd_parts.extend(["--shm-size-gb", str(args.shm_size_gb)])
         cmd_parts.extend(["\\", "\n      --launch-script", "/tmp/tmpXXXXXX.sh"])
         print(" ".join(cmd_parts))
         print()
@@ -1155,17 +1217,41 @@ Examples:
         
         if args.daemon:
             cmd.append("-d")
-        
+
+        if getattr(args, 'no_ray', False):
+            cmd.append("--no-ray")
+
         # Pass nodes to launch-cluster.sh (from command line, .env, or autodiscover)
         if nodes:
             cmd.extend(["-n", ",".join(nodes)])
         
         if args.nccl_debug:
             cmd.extend(["--nccl-debug", args.nccl_debug])
-        
+
         for env_var in args.env_vars:
             cmd.extend(["-e", env_var])
-        
+
+        if args.container_name:
+            cmd.extend(["--name", args.container_name])
+        if eth_if:
+            cmd.extend(["--eth-if", eth_if])
+        if ib_if:
+            cmd.extend(["--ib-if", ib_if])
+        if args.build_jobs:
+            cmd.extend(["-j", str(args.build_jobs)])
+        if args.no_cache_dirs:
+            cmd.append("--no-cache-dirs")
+        if args.non_privileged:
+            cmd.append("--non-privileged")
+        if args.mem_limit_gb:
+            cmd.extend(["--mem-limit-gb", str(args.mem_limit_gb)])
+        if args.mem_swap_limit_gb:
+            cmd.extend(["--mem-swap-limit-gb", str(args.mem_swap_limit_gb)])
+        if args.pids_limit:
+            cmd.extend(["--pids-limit", str(args.pids_limit)])
+        if args.shm_size_gb:
+            cmd.extend(["--shm-size-gb", str(args.shm_size_gb)])
+
         # Add launch script
         cmd.extend(["--launch-script", temp_script])
         

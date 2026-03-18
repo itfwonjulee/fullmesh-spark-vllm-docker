@@ -32,6 +32,8 @@ SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 
 ACTIONS_ARG=""
 SOLO_MODE="false"
+NO_RAY_MODE="false"
+LAUNCH_SCRIPT_MODE="false"
 MOUNT_CACHE_DIRS="true"
 BUILD_JOBS=""
 NON_PRIVILEGED_MODE="false"
@@ -55,6 +57,7 @@ usage() {
     echo "  --launch-script Path to bash script to execute in the container (from examples/ directory or absolute path). If launch script is specified, action should be omitted."
     echo "  --check-config  Check configuration and auto-detection without launching"
     echo "  --solo          Solo mode: skip autodetection, launch only on current node, do not launch Ray cluster"
+    echo "  --no-ray        No-Ray mode: run multi-node vLLM without Ray (uses PyTorch distributed backend)"
     echo "  --no-cache-dirs Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.triton)"
     echo "  -d              Daemon mode (only for 'start' action)"
     echo "  --non-privileged Run in non-privileged mode (removes --privileged and --ipc=host)"
@@ -93,6 +96,7 @@ while [[ "$#" -gt 0 ]]; do
             ;;
         --check-config) CHECK_CONFIG="true" ;;
         --solo) SOLO_MODE="true" ;;
+        --no-ray) NO_RAY_MODE="true" ;;
         --no-cache-dirs) MOUNT_CACHE_DIRS="false" ;;
         --non-privileged) NON_PRIVILEGED_MODE="true" ;;
         --mem-limit-gb) MEM_LIMIT_GB="$2"; shift ;;
@@ -204,7 +208,8 @@ if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
     
     # Set command to run the copied script (use absolute path since docker exec may not be in /workspace)
     COMMAND_TO_RUN="/workspace/exec-script.sh"
-    
+    LAUNCH_SCRIPT_MODE="true"
+
     # If launch script is specified, default action to exec unless explicitly set to stop/status
     if [[ "$ACTION" == "start" ]]; then
         ACTION="exec"
@@ -303,6 +308,11 @@ if [[ "$SOLO_MODE" == "false" && ${#PEER_NODES[@]} -eq 0 ]]; then
     SOLO_MODE="true"
 fi
 
+if [[ "$NO_RAY_MODE" == "true" && "$SOLO_MODE" == "true" ]]; then
+    echo "Warning: Only one node detected; --no-ray has no effect in solo mode. Proceeding normally."
+    NO_RAY_MODE="false"
+fi
+
 echo "Head Node: $HEAD_IP"
 echo "Worker Nodes: ${PEER_NODES[*]}"
 echo "Container Name: $CONTAINER_NAME"
@@ -377,9 +387,11 @@ if [[ "$ACTION" == "status" ]]; then
     # Check Head
     if docker ps | grep -q "$CONTAINER_NAME"; then
         echo "[HEAD] $HEAD_IP: Container '$CONTAINER_NAME' is RUNNING."
-        echo "--- Ray Status ---"
-        docker exec "$CONTAINER_NAME" ray status || echo "Failed to get ray status."
-        echo "------------------"
+        if [[ "$NO_RAY_MODE" == "false" ]]; then
+            echo "--- Ray Status ---"
+            docker exec "$CONTAINER_NAME" ray status || echo "Failed to get ray status."
+            echo "------------------"
+        fi
     else
         echo "[HEAD] $HEAD_IP: Container '$CONTAINER_NAME' is NOT running."
     fi
@@ -537,23 +549,79 @@ apply_mod_to_container() {
     fi
 }
 
-# Copy Launch Script to Container Function
-copy_launch_script_to_container() {
-    local container="$1"
-    local script_path="$2"
+# Build a patched copy of the launch script on the host for a specific node.
+# Strips --distributed-executor-backend and appends multi-node args.
+# Prints the path of the temp file (caller must delete it).
+make_node_script() {
+    local script_path="$1"; local nnodes="$2"; local node_rank="$3"; local master_addr="$4"
+    local extra="--nnodes $nnodes --node-rank $node_rank --master-addr $master_addr"
+    [[ "$node_rank" -gt 0 ]] && extra="$extra --headless"
 
-    echo "Copying launch script to head node..."
+    local tmp; tmp=$(mktemp /tmp/vllm_node_script_XXXXXX.sh)
+    grep -v -- '--distributed-executor-backend' "$script_path" > "$tmp"
+    sed -i "$ s/$/ $extra/" "$tmp"
+    chmod +x "$tmp"
+    echo "$tmp"
+}
 
-    local target_script_path="$script_path"
-
-    # Copy script into container as /workspace/exec-script.sh
-    echo "  Copying script into container..."
-    docker cp "$target_script_path" "$container:/workspace/exec-script.sh"
-
-    # Make executable
+# Copy a script file into a local container as /workspace/exec-script.sh
+copy_script_to_container() {
+    local container="$1"; local script_path="$2"; local label="${3:-node}"
+    echo "Copying launch script to $label..."
+    docker cp "$script_path" "$container:/workspace/exec-script.sh" || { echo "Error: docker cp to $label failed"; exit 1; }
     docker exec "$container" chmod +x /workspace/exec-script.sh
+}
 
-    echo "  Launch script copied to head node"
+# Copy a script file to a remote container via scp + docker cp
+copy_script_to_worker() {
+    local worker_ip="$1"; local container="$2"; local script_path="$3"
+    echo "Copying launch script to worker $worker_ip..."
+    local remote_tmp="/tmp/vllm_script_$(date +%s)_$RANDOM.sh"
+    scp -o BatchMode=yes -o StrictHostKeyChecking=no "$script_path" "$worker_ip:$remote_tmp" || { echo "Error: scp to $worker_ip failed"; exit 1; }
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_ip" \
+        "docker cp $remote_tmp $container:/workspace/exec-script.sh && \
+         docker exec $container chmod +x /workspace/exec-script.sh && \
+         rm -f $remote_tmp" || { echo "Error: docker cp to worker $worker_ip failed"; exit 1; }
+}
+
+# Build -e KEY=VALUE flags for a given node IP (used in docker run and docker exec)
+get_env_flags() {
+    local node_ip="$1"
+    printf -- '-e %s ' \
+        "VLLM_HOST_IP=$node_ip" \
+        "RAY_NODE_IP_ADDRESS=$node_ip" \
+        "RAY_OVERRIDE_NODE_IP_ADDRESS=$node_ip" \
+        "MN_IF_NAME=$ETH_IF" \
+        "UCX_NET_DEVICES=$ETH_IF" \
+        "NCCL_SOCKET_IFNAME=$ETH_IF" \
+        "NCCL_IB_HCA=$IB_IF" \
+        "NCCL_IB_DISABLE=0" \
+        "OMPI_MCA_btl_tcp_if_include=$ETH_IF" \
+        "GLOO_SOCKET_IFNAME=$ETH_IF" \
+        "TP_SOCKET_IFNAME=$ETH_IF" \
+        "RAY_memory_monitor_refresh_ms=0" \
+        "RAY_num_prestart_python_workers=0" \
+        "RAY_object_store_memory=1073741824"
+}
+
+# Start Ray head node inside the container
+start_ray_head() {
+    local container="$1"
+    echo "Starting Ray HEAD node on $HEAD_IP..."
+    docker exec -d "$container" bash -c \
+        "ray start --block --head --port 6379 --object-store-memory 1073741824 --num-cpus 2 \
+         --node-ip-address $HEAD_IP --include-dashboard=false --disable-usage-stats \
+         >> /proc/1/fd/1 2>&1"
+}
+
+# Start Ray worker node inside the container on a remote host
+start_ray_worker() {
+    local worker_ip="$1"; local container="$2"
+    echo "Starting Ray WORKER node on $worker_ip..."
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_ip" \
+        "docker exec -d $container bash -c \
+         'ray start --block --object-store-memory 1073741824 --num-cpus 2 --disable-usage-stats \
+          --address=$HEAD_IP:6379 --node-ip-address $worker_ip >> /proc/1/fd/1 2>&1'"
 }
 
 # Start Cluster Function
@@ -562,31 +630,6 @@ start_cluster() {
 
     if [[ "$CLUSTER_WAS_RUNNING" == "true" ]]; then
         return
-    fi
-
-    # Start Head Node
-    echo "Starting Head Node on $HEAD_IP..."
-    
-    # Ensure cache dirs exist on head
-    if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
-        for dir in "${CACHE_DIRS_TO_CREATE[@]}"; do
-            mkdir -p "$dir"
-        done
-    fi
-
-    local head_cmd_args=()
-    if [[ "$SOLO_MODE" == "true" ]]; then
-        if [[ ${#MOD_PATHS[@]} -gt 0 ]]; then
-             head_cmd_args=(bash -c "echo Waiting for mod application...; while [ ! -f /tmp/mod_done ]; do sleep 1; done; echo Mod applied, starting container...; exec sleep infinity")
-        else
-             head_cmd_args=(sleep infinity)
-        fi
-    else
-        if [[ ${#MOD_PATHS[@]} -gt 0 ]]; then
-            head_cmd_args=(bash -c "echo Waiting for mod application...; while [ ! -f /tmp/mod_done ]; do sleep 1; done; echo Mod applied, starting node...; exec ./run-cluster-node.sh --role head --host-ip $HEAD_IP --eth-if $ETH_IF --ib-if $IB_IF")
-        else
-            head_cmd_args=(./run-cluster-node.sh --role head --host-ip "$HEAD_IP" --eth-if "$ETH_IF" --ib-if "$IB_IF")
-        fi
     fi
 
     # Build docker run arguments based on mode
@@ -603,62 +646,68 @@ start_cluster() {
         docker_resource_args="--ipc=host"
     fi
 
+    # Start Head Node
+    echo "Starting Head Node on $HEAD_IP..."
+    if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
+        for dir in "${CACHE_DIRS_TO_CREATE[@]}"; do
+            mkdir -p "$dir"
+        done
+    fi
     docker run $docker_caps_args $docker_resource_args \
-        $docker_args_common \
-        "${head_cmd_args[@]}"
+        $(get_env_flags "$HEAD_IP") $docker_args_common sleep infinity
 
     # Start Worker Nodes
     for worker in "${PEER_NODES[@]}"; do
         echo "Starting Worker Node on $worker..."
-        
-        # Ensure cache dirs exist on worker
         if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
-             # Create string of dirs to create
-             dirs_str="${CACHE_DIRS_TO_CREATE[*]}"
-             ssh "$worker" "mkdir -p $dirs_str"
+            ssh "$worker" "mkdir -p ${CACHE_DIRS_TO_CREATE[*]}"
         fi
-
-        local docker_run_cmd="docker run $docker_caps_args $docker_resource_args $docker_args_common"
-        
-        if [[ ${#MOD_PATHS[@]} -gt 0 ]]; then
-            local inner_script="echo Waiting for mod application...; while [ ! -f /tmp/mod_done ]; do sleep 1; done; echo Mod applied, starting node...; exec ./run-cluster-node.sh --role node --host-ip $worker --eth-if $ETH_IF --ib-if $IB_IF --head-ip $HEAD_IP"
-            ssh "$worker" "$docker_run_cmd bash -c \"$inner_script\""
-        else
-            ssh "$worker" "$docker_run_cmd ./run-cluster-node.sh --role node --host-ip $worker --eth-if $ETH_IF --ib-if $IB_IF --head-ip $HEAD_IP"
-        fi
+        local docker_run_cmd="docker run $docker_caps_args $docker_resource_args $(get_env_flags "$worker") $docker_args_common"
+        ssh "$worker" "$docker_run_cmd sleep infinity"
     done
 
-    # Apply mods if requested
+    # Apply mods (containers are idle — no mod_done sync needed)
     if [[ ${#MOD_PATHS[@]} -gt 0 ]]; then
         echo "Applying modifications to cluster nodes..."
-        
-        # Apply to Head
         for i in "${!MOD_PATHS[@]}"; do
             apply_mod_to_container "$HEAD_IP" "$CONTAINER_NAME" "true" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"
         done
-        # Signal completion on Head
-        docker exec "$CONTAINER_NAME" touch /tmp/mod_done
-        
-        # Apply to Workers
         for worker in "${PEER_NODES[@]}"; do
             for i in "${!MOD_PATHS[@]}"; do
                 apply_mod_to_container "$worker" "$CONTAINER_NAME" "false" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"
             done
-            # Signal completion on Worker
-            ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "docker exec $CONTAINER_NAME touch /tmp/mod_done"
         done
     fi
 
-    # Copy launch script to head node only (workers don't need it - they just run Ray)
+    # Copy (and patch for no-ray) launch script
     if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
-        copy_launch_script_to_container "$CONTAINER_NAME" "$LAUNCH_SCRIPT_PATH"
+        local total_nodes=$(( 1 + ${#PEER_NODES[@]} ))
+        if [[ "$NO_RAY_MODE" == "true" ]]; then
+            # Build per-node patched scripts on the host, then copy
+            local head_script; head_script=$(make_node_script "$LAUNCH_SCRIPT_PATH" "$total_nodes" "0" "$HEAD_IP")
+            copy_script_to_container "$CONTAINER_NAME" "$head_script" "head node ($HEAD_IP)"
+            rm -f "$head_script"
+
+            local rank=1
+            for worker in "${PEER_NODES[@]}"; do
+                local worker_script; worker_script=$(make_node_script "$LAUNCH_SCRIPT_PATH" "$total_nodes" "$rank" "$HEAD_IP")
+                copy_script_to_worker "$worker" "$CONTAINER_NAME" "$worker_script"
+                rm -f "$worker_script"
+                (( rank++ ))
+            done
+        else
+            copy_script_to_container "$CONTAINER_NAME" "$LAUNCH_SCRIPT_PATH" "head node"
+        fi
     fi
 
-    if [[ "$SOLO_MODE" == "false" ]]; then
+    # Start Ray cluster (unless solo or no-ray)
+    if [[ "$SOLO_MODE" == "false" && "$NO_RAY_MODE" == "false" ]]; then
+        start_ray_head "$CONTAINER_NAME"
+        for worker in "${PEER_NODES[@]}"; do
+            start_ray_worker "$worker" "$CONTAINER_NAME"
+        done
         wait_for_cluster
     else
-        echo "Solo mode active: Skipping Ray cluster readiness check."
-        # Give container a moment to start up
         sleep 2
     fi
 }
@@ -686,25 +735,72 @@ wait_for_cluster() {
     exit 1
 }
 
-if [[ "$ACTION" == "exec" ]]; then
-    start_cluster
-    echo "Executing command on head node: $COMMAND_TO_RUN"
-
+# Execute command on head node (daemon or interactive)
+_exec_on_head() {
+    local cmd="$1"
     if [[ "$DAEMON_MODE" == "true" ]]; then
-        # Daemon mode: run command detached inside the container and exit immediately
-        # Extract env vars starting from VLLM_HOST_IP to avoid interactive check in .bashrc
-        # Redirect output to PID 1 stdout/stderr so it shows up in docker logs
-        docker exec -d "$CONTAINER_NAME" bash -c "eval \"\$(sed -n '/export VLLM_HOST_IP/,\$p' /root/.bashrc)\" && { $COMMAND_TO_RUN; } >> /proc/1/fd/1 2>> /proc/1/fd/2"
+        docker exec -d "$CONTAINER_NAME" bash -c "$cmd >> /proc/1/fd/1 2>&1"
         echo "Command dispatched in background (Daemon mode). Container: $CONTAINER_NAME"
     else
-        # Check if running in a TTY to avoid "input device is not a TTY" error
-        if [ -t 0 ]; then
-            DOCKER_EXEC_FLAGS="-it"
-        else
-            DOCKER_EXEC_FLAGS="-i"
-        fi
+        if [ -t 0 ]; then DOCKER_EXEC_FLAGS="-it"; else DOCKER_EXEC_FLAGS="-i"; fi
+        docker exec $DOCKER_EXEC_FLAGS "$CONTAINER_NAME" $cmd
+    fi
+}
 
-        docker exec $DOCKER_EXEC_FLAGS "$CONTAINER_NAME" bash -i -c "$COMMAND_TO_RUN"
+# Execute a no-ray multi-node command: workers (background) then head
+exec_no_ray_cluster() {
+    local base_cmd="$1"
+    local total_nodes=$(( 1 + ${#PEER_NODES[@]} ))
+
+    # Launch workers first (always background)
+    local rank=1
+    for worker in "${PEER_NODES[@]}"; do
+        local worker_cmd
+        if [[ "$LAUNCH_SCRIPT_MODE" == "true" ]]; then
+            worker_cmd="$base_cmd"  # script already patched per-node in start_cluster()
+        else
+            local clean
+            clean=$(echo "$base_cmd" | sed 's/--distributed-executor-backend[[:space:]]*[^[:space:]]*//')
+            worker_cmd="$clean --nnodes $total_nodes --node-rank $rank --master-addr $HEAD_IP --headless"
+        fi
+        echo "Launching worker (rank $rank) on $worker..."
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" \
+            "docker exec -d $CONTAINER_NAME bash -c \"$worker_cmd >> /proc/1/fd/1 2>&1\""
+        (( rank++ ))
+    done
+
+    # Launch head (rank 0) last
+    local head_cmd
+    if [[ "$LAUNCH_SCRIPT_MODE" == "true" ]]; then
+        head_cmd="$base_cmd"
+    else
+        local clean
+        clean=$(echo "$base_cmd" | sed 's/--distributed-executor-backend[[:space:]]*[^[:space:]]*//')
+        head_cmd="$clean --nnodes $total_nodes --node-rank 0 --master-addr $HEAD_IP"
+    fi
+
+    echo "Executing command on head node (rank 0): $head_cmd"
+    if [[ "$DAEMON_MODE" == "true" ]]; then
+        docker exec -d "$CONTAINER_NAME" bash -c "$head_cmd >> /proc/1/fd/1 2>&1"
+        echo "Command dispatched in background (Daemon mode). Container: $CONTAINER_NAME"
+    else
+        if [ -t 0 ]; then DOCKER_EXEC_FLAGS="-it"; else DOCKER_EXEC_FLAGS="-i"; fi
+        docker exec $DOCKER_EXEC_FLAGS "$CONTAINER_NAME" $head_cmd
+    fi
+}
+
+if [[ "$ACTION" == "exec" ]]; then
+    start_cluster
+    echo "Executing command: $COMMAND_TO_RUN"
+
+    if [[ "$NO_RAY_MODE" == "true" && ${#PEER_NODES[@]} -gt 0 ]]; then
+        if [[ "$LAUNCH_SCRIPT_MODE" == "true" ]] || echo "$COMMAND_TO_RUN" | grep -q "vllm serve"; then
+            exec_no_ray_cluster "$COMMAND_TO_RUN"
+        else
+            _exec_on_head "$COMMAND_TO_RUN"
+        fi
+    else
+        _exec_on_head "$COMMAND_TO_RUN"
     fi
 elif [[ "$ACTION" == "start" ]]; then
     start_cluster
